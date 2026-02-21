@@ -36,6 +36,101 @@ except ImportError:
     print("Error: open3d is not installed. Install it with: pip install open3d")
     sys.exit(1)
 
+# Optional: pyransac provides a generic RANSAC framework with adaptive
+# iteration (confidence-based early stopping).  When available, custom 3D
+# models below allow using it as an alternative backend.
+try:
+    from pyransac import find_inliers as pyransac_find_inliers, RansacParams
+    from pyransac.base import Model as PyransacModel
+    HAS_PYRANSAC = True
+except ImportError:
+    HAS_PYRANSAC = False
+
+
+# =============================================================================
+# Custom pyransac 3D models (adaptive-iteration RANSAC backend)
+# =============================================================================
+
+if HAS_PYRANSAC:
+    from dataclasses import dataclass
+
+    @dataclass(order=True)
+    class Point3D:
+        """Simple 3D point used by pyransac models."""
+        x: float
+        y: float
+        z: float
+
+    class Plane3D(PyransacModel):
+        """
+        3D plane model for pyransac.
+
+        A plane is defined by the equation  Ax + By + Cz + D = 0.
+        ``make_model`` computes the plane from exactly 3 non-collinear
+        points.  ``calc_error`` returns the perpendicular distance from
+        a point to the plane.
+        """
+        def __init__(self):
+            self.a = None
+            self.b = None
+            self.c = None
+            self.d = None
+
+        def make_model(self, points):
+            if len(points) != 3:
+                raise ValueError(f"Need 3 points to define a plane, got {len(points)}")
+            p0, p1, p2 = points
+            v1 = np.array([p1.x - p0.x, p1.y - p0.y, p1.z - p0.z])
+            v2 = np.array([p2.x - p0.x, p2.y - p0.y, p2.z - p0.z])
+            normal = np.cross(v1, v2)
+            norm = np.linalg.norm(normal)
+            if norm < 1e-12:
+                # Degenerate (collinear) — force large errors
+                self.a = self.b = self.c = self.d = 0.0
+                return
+            normal = normal / norm
+            self.a, self.b, self.c = normal
+            self.d = -(self.a * p0.x + self.b * p0.y + self.c * p0.z)
+
+        def calc_error(self, point):
+            if self.a is None:
+                return float('inf')
+            return abs(self.a * point.x + self.b * point.y
+                       + self.c * point.z + self.d)
+
+    class Line3D(PyransacModel):
+        """
+        3D line model for pyransac.
+
+        A line is defined by a point ``p0`` and a unit direction ``d``.
+        ``make_model`` computes the line from exactly 2 points.
+        ``calc_error`` returns the perpendicular distance from a point
+        to the infinite line.
+        """
+        def __init__(self):
+            self.p0 = None
+            self.direction = None
+
+        def make_model(self, points):
+            if len(points) != 2:
+                raise ValueError(f"Need 2 points to define a line, got {len(points)}")
+            a, b = points
+            d = np.array([b.x - a.x, b.y - a.y, b.z - a.z])
+            norm = np.linalg.norm(d)
+            if norm < 1e-12:
+                self.p0 = None
+                self.direction = None
+                return
+            self.direction = d / norm
+            self.p0 = np.array([a.x, a.y, a.z])
+
+        def calc_error(self, point):
+            if self.p0 is None:
+                return float('inf')
+            v = np.array([point.x, point.y, point.z]) - self.p0
+            proj = np.dot(v, self.direction) * self.direction
+            return float(np.linalg.norm(v - proj))
+
 
 def load_pcd_file(pcd_file):
     """
@@ -204,7 +299,8 @@ def downsample_points(points, voxel_size=0.01):
 # =============================================================================
 
 def detect_rectangle(points, plane_thresh=0.02, plane_iterations=1000,
-                     min_inliers=50, vertical_axis=1):
+                     min_inliers=50, vertical_axis=1,
+                     use_pyransac=False, confidence=0.999):
     """
     Detect a rectangular structure in the point cloud.
     
@@ -229,6 +325,15 @@ def detect_rectangle(points, plane_thresh=0.02, plane_iterations=1000,
         Minimum inliers required for a valid rectangle (default: 50)
     vertical_axis : int
         Index of vertical axis: 0=X, 1=Y, 2=Z (default: 1=Y)
+    use_pyransac : bool
+        If True, use pyransac's adaptive-iteration RANSAC with confidence-
+        based early stopping instead of pyransac3d's fixed-iteration RANSAC.
+        This can be faster when the plane is easy to find (high inlier ratio)
+        because it stops iterating once the confidence threshold is met.
+    confidence : float
+        Confidence level for pyransac adaptive stopping (default: 0.999).
+        Higher values run more iterations but are more likely to find the
+        best model.  Only used when use_pyransac=True.
     
     Returns:
     --------
@@ -251,10 +356,32 @@ def detect_rectangle(points, plane_thresh=0.02, plane_iterations=1000,
         return None
     
     # Step 1: Find the dominant plane with RANSAC
-    print(f"\n  Fitting plane with RANSAC (thresh={plane_thresh}, max_iter={plane_iterations})...")
-    plane = pyrsc.Plane()
-    plane_eq, inliers = plane.fit(points, thresh=plane_thresh,
-                                  maxIteration=plane_iterations)
+    if use_pyransac and HAS_PYRANSAC:
+        # --- pyransac backend: adaptive iteration with early stopping ---
+        print(f"\n  Fitting plane with pyransac (thresh={plane_thresh}, "
+              f"max_iter={plane_iterations}, confidence={confidence})...")
+        point_list = [Point3D(p[0], p[1], p[2]) for p in points]
+        params = RansacParams(samples=3, iterations=plane_iterations,
+                              confidence=confidence, threshold=plane_thresh)
+        model = Plane3D()
+        inlier_objs = pyransac_find_inliers(point_list, model, params)
+
+        # Map inlier objects back to indices
+        inlier_set = set(id(p) for p in inlier_objs)
+        inliers = [i for i, p in enumerate(point_list) if id(p) in inlier_set]
+
+        if len(inliers) < min_inliers:
+            print(f"  Plane has only {len(inliers)} inliers (need {min_inliers}), skipping")
+            return None
+
+        # Rebuild the plane equation from the final model state
+        plane_eq = [model.a, model.b, model.c, model.d]
+    else:
+        # --- pyransac3d backend: fixed iteration ---
+        print(f"\n  Fitting plane with RANSAC (thresh={plane_thresh}, max_iter={plane_iterations})...")
+        plane = pyrsc.Plane()
+        plane_eq, inliers = plane.fit(points, thresh=plane_thresh,
+                                      maxIteration=plane_iterations)
     
     if len(inliers) < min_inliers:
         print(f"  Plane has only {len(inliers)} inliers (need {min_inliers}), skipping")
@@ -411,11 +538,25 @@ def detect_rectangle(points, plane_thresh=0.02, plane_iterations=1000,
     # Compute distance from the camera (origin) to the rectangle center
     distance_to_center = np.linalg.norm(center_3d)
     
+    # Compute depth: perpendicular distance from the camera to the plane of
+    # the rectangle.  This is how far "forward" the robot must drive along
+    # the plane's normal direction to be on the same plane as the rectangle.
+    # Using the plane equation Ax + By + Cz + D = 0 evaluated at origin:
+    #   depth = |A*0 + B*0 + C*0 + D| / ||(A,B,C)|| = |D| / ||(A,B,C)||
+    # Since we already have a unit normal, this simplifies to |D / 1| = |D|.
+    # But we recalculate properly in case of floating point drift.
+    plane_normal_len = np.linalg.norm(plane_eq[:3])
+    if plane_normal_len > 1e-10:
+        depth = abs(plane_eq[3]) / plane_normal_len
+    else:
+        depth = abs(center_3d[2])  # fallback: use Z coordinate
+    
     axis_names = ['X', 'Y', 'Z']
     print(f"  Rectangle detected:")
     print(f"    Center:             ({center_3d[0]:.4f}, {center_3d[1]:.4f}, {center_3d[2]:.4f})")
     print(f"    Horizontal center:  {horizontal_center:+.4f} m (X offset from camera)")
-    print(f"    Distance to center: {distance_to_center:.4f} m")
+    print(f"    Depth:              {depth:.4f} m (perpendicular distance to plane)")
+    print(f"    Distance to center: {distance_to_center:.4f} m (Euclidean)")
     print(f"    Width:              {width:.4f} m")
     print(f"    Height:             {height:.4f} m")
     print(f"    Aspect ratio:       {aspect_ratio:.2f}")
@@ -425,6 +566,7 @@ def detect_rectangle(points, plane_thresh=0.02, plane_iterations=1000,
     return {
         'center_3d': center_3d,
         'horizontal_center': horizontal_center,
+        'depth': depth,
         'distance_to_center': distance_to_center,
         'corners_3d': corners_3d,
         'width': width,
@@ -601,7 +743,9 @@ def print_rectangle_summary(rect):
     print(f"  Horizontal center (X): {rect['horizontal_center']:+.4f} m")
     print(f"    (negative = rectangle is LEFT of camera,")
     print(f"     positive = rectangle is RIGHT of camera)")
-    print(f"  Distance to center:    {rect['distance_to_center']:.4f} m")
+    print(f"  Depth to plane:        {rect['depth']:.4f} m")
+    print(f"    (perpendicular distance from camera to the rectangle's plane)")
+    print(f"  Distance to center:    {rect['distance_to_center']:.4f} m  (Euclidean)")
     print(f"")
     print(f"  --- Rectangle details ---")
     print(f"  Center 3D:       ({c[0]:+.4f}, {c[1]:+.4f}, {c[2]:+.4f})")
@@ -666,9 +810,10 @@ def classify_line_orientation(direction_vector, vertical_axis=1, angle_threshold
 
 
 def detect_single_line(points, thresh=0.05, max_iterations=1000, 
-                       vertical_axis=1, angle_threshold=15):
+                       vertical_axis=1, angle_threshold=15,
+                       use_pyransac=False, confidence=0.999):
     """
-    Detect a single line using pyransac3d
+    Detect a single line using RANSAC.
     
     Parameters:
     -----------
@@ -682,6 +827,12 @@ def detect_single_line(points, thresh=0.05, max_iterations=1000,
         Index of vertical axis (0=X, 1=Y, 2=Z)
     angle_threshold : float
         Angle threshold for classification in degrees
+    use_pyransac : bool
+        If True, use pyransac's adaptive-iteration RANSAC (Line3D model)
+        instead of pyransac3d's fixed-iteration Line.fit().
+    confidence : float
+        Confidence level for pyransac adaptive stopping (default: 0.999).
+        Only used when use_pyransac=True.
     
     Returns:
     --------
@@ -691,22 +842,41 @@ def detect_single_line(points, thresh=0.05, max_iterations=1000,
     if len(points) < 2:
         return None
     
-    line = pyrsc.Line()
-    
     try:
-        A, B, inliers = line.fit(points, thresh=thresh, maxIteration=max_iterations)
-        
-        if len(inliers) < 2:
-            return None
+        if use_pyransac and HAS_PYRANSAC:
+            # --- pyransac backend: adaptive iteration ---
+            point_list = [Point3D(p[0], p[1], p[2]) for p in points]
+            params = RansacParams(samples=2, iterations=max_iterations,
+                                  confidence=confidence, threshold=thresh)
+            model = Line3D()
+            inlier_objs = pyransac_find_inliers(point_list, model, params)
+
+            if len(inlier_objs) < 2:
+                return None
+
+            # Map inlier objects back to indices
+            inlier_set = set(id(p) for p in inlier_objs)
+            inliers = [i for i, p in enumerate(point_list)
+                        if id(p) in inlier_set]
+
+            # Direction and point from the final model
+            A = model.direction.copy()
+            B = model.p0.copy()
+        else:
+            # --- pyransac3d backend: fixed iteration ---
+            line = pyrsc.Line()
+            A, B, inliers = line.fit(points, thresh=thresh,
+                                     maxIteration=max_iterations)
+
+            if len(inliers) < 2:
+                return None
+
+            A = np.array(A).flatten()
+            B = np.array(B).flatten()
         
         # Get inlier points
         inlier_points = points[inliers]
-        
-        # Calculate line extent along the direction
-        # Project points onto the line direction
-        A = np.array(A).flatten()
-        B = np.array(B).flatten()
-        
+
         # Direction vector (normalized)
         direction = A / np.linalg.norm(A) if np.linalg.norm(A) > 1e-10 else A
         
@@ -740,7 +910,8 @@ def detect_single_line(points, thresh=0.05, max_iterations=1000,
 
 def detect_multiple_lines(points, max_lines=10, thresh=0.05, max_iterations=1000,
                           min_inliers=20, removal_thresh=None,
-                          vertical_axis=1, angle_threshold=15):
+                          vertical_axis=1, angle_threshold=15,
+                          use_pyransac=False, confidence=0.999):
     """
     Detect multiple lines using sequential RANSAC
     
@@ -763,6 +934,12 @@ def detect_multiple_lines(points, max_lines=10, thresh=0.05, max_iterations=1000
         Index of vertical axis (0=X, 1=Y, 2=Z)
     angle_threshold : float
         Angle threshold for classification in degrees
+    use_pyransac : bool
+        If True, use pyransac's adaptive-iteration RANSAC instead of
+        pyransac3d's fixed-iteration RANSAC for each line.
+    confidence : float
+        Confidence level for pyransac adaptive stopping (default: 0.999).
+        Only used when use_pyransac=True.
     
     Returns:
     --------
@@ -789,7 +966,9 @@ def detect_multiple_lines(points, max_lines=10, thresh=0.05, max_iterations=1000
             thresh=thresh,
             max_iterations=max_iterations,
             vertical_axis=vertical_axis,
-            angle_threshold=angle_threshold
+            angle_threshold=angle_threshold,
+            use_pyransac=use_pyransac,
+            confidence=confidence
         )
         
         if line is None or line['n_inliers'] < min_inliers:
@@ -1136,7 +1315,26 @@ Examples:
                             choices=['all', 'vertical', 'horizontal', 'both'],
                             help='Filter output by line orientation (default: all)')
     
+    # pyransac backend args
+    ransac_group = parser.add_argument_group('pyransac backend options')
+    ransac_group.add_argument('--use-pyransac', action='store_true',
+                              help='Use pyransac adaptive-iteration RANSAC instead of '
+                                   'pyransac3d fixed-iteration RANSAC.  This can be '
+                                   'faster when the target structure has a high inlier '
+                                   'ratio because it stops early once the confidence '
+                                   'threshold is met.')
+    ransac_group.add_argument('--confidence', type=float, default=0.999,
+                              help='Confidence level for adaptive RANSAC stopping '
+                                   '(0-1, default: 0.999). Higher values run more '
+                                   'iterations. Only used with --use-pyransac.')
+
     args = parser.parse_args()
+
+    # Validate pyransac availability
+    if args.use_pyransac and not HAS_PYRANSAC:
+        print("Error: --use-pyransac requested but pyransac is not installed.")
+        print("       Install it with: pip install pyransac")
+        sys.exit(1)
     
     # Load point cloud
     print(f"Loading PCD file: {args.pcd_file}")
@@ -1194,7 +1392,9 @@ Examples:
             plane_thresh=args.plane_threshold,
             plane_iterations=args.plane_iterations,
             min_inliers=args.min_inliers if hasattr(args, 'min_inliers') else 50,
-            vertical_axis=args.vertical_axis
+            vertical_axis=args.vertical_axis,
+            use_pyransac=args.use_pyransac,
+            confidence=args.confidence
         )
         
         print_rectangle_summary(rect)
@@ -1225,7 +1425,9 @@ Examples:
             max_iterations=args.max_iterations,
             min_inliers=args.min_inliers,
             vertical_axis=args.vertical_axis,
-            angle_threshold=args.angle_threshold
+            angle_threshold=args.angle_threshold,
+            use_pyransac=args.use_pyransac,
+            confidence=args.confidence
         )
         
         vertical_lines = [l for l in all_lines if l['orientation'] == 'vertical']
@@ -1251,7 +1453,9 @@ Examples:
             max_iterations=args.max_iterations,
             min_inliers=args.min_inliers,
             vertical_axis=args.vertical_axis,
-            angle_threshold=args.angle_threshold
+            angle_threshold=args.angle_threshold,
+            use_pyransac=args.use_pyransac,
+            confidence=args.confidence
         )
         
         horizontal_lines = [l for l in remaining_lines if l['orientation'] == 'horizontal']

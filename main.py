@@ -1,16 +1,19 @@
 """
 Climber Rectangle Detector — FIRST Robotics
 
-Detects the flat rectangular face of the climber from a RealSense .pcd file.
-Returns two values for robot alignment:
-  - horizontal_offset: X distance from camera center to rectangle center (m)
-  - depth:             perpendicular distance from camera to rectangle plane (m)
+Runs continuously on a Raspberry Pi. Each loop iteration reads a .pcd file,
+detects the flat rectangular face of the climber, and publishes to NetworkTables:
+  - /climber/detected           (bool)
+  - /climber/horizontal_offset  (double, meters)
+  - /climber/depth              (double, meters)
 """
 
 import sys
+import time
 import numpy as np
 import pyransac3d as pyrsc
 import open3d as o3d
+from networktables import NetworkTables
 
 
 def detect_climber(pcd_path, max_distance=1.25, plane_thresh=0.02,
@@ -77,14 +80,35 @@ def detect_climber(pcd_path, max_distance=1.25, plane_thresh=0.02,
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else None
     if path is None:
-        print("Usage: python main.py <pcd_file>")
+        print("Usage: python main.py <pcd_file> [team_number|roborio_ip]")
         sys.exit(1)
 
-    result = detect_climber(path)
-    if result is None:
-        print("No rectangle detected.")
-        sys.exit(1)
+    # NetworkTables setup — connect as a client to the roboRIO
+    server = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.2"
+    if server.isdigit():
+        team = int(server)
+        server = f"10.{team // 100}.{team % 100}.2"
 
-    h, d = result
-    print(f"horizontal_offset: {h:+.4f} m")
-    print(f"depth:             {d:.4f} m")
+    NetworkTables.initialize(server=server)
+    table = NetworkTables.getTable("real-sense-camera-climber")
+
+    print(f"NetworkTables connecting to {server} ...")
+    print(f"Publishing to /real-sense-camera-climber/  |  Reading PCD: {path}")
+
+    try:
+        while True:
+            result = detect_climber(path)
+            if result is None:
+                table.putBoolean("detected", False)
+                table.putNumber("horizontal_offset", 0.0)
+                table.putNumber("depth", 0.0)
+            else:
+                h, d = result
+                table.putBoolean("detected", True)
+                table.putNumber("horizontal_offset", h)
+                table.putNumber("depth", d)
+            NetworkTables.flush()
+            time.sleep(0.02)   # ~50 Hz cap; detection itself is the bottleneck
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        NetworkTables.shutdown()

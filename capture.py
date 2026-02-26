@@ -105,11 +105,19 @@ def main():
     print("RealSense camera initialised")
     print(f"Writing point clouds to: {args.output}")
 
+    frame_count = 0
     try:
         while True:
+            print(f"  grabbing frame {frame_count + 1}...", end="", flush=True)
             points = capture_frame(cam, K)
+            print(f" got {len(points)} points", flush=True)
             if len(points) > 0:
                 write_pcd(args.output, points)
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    print(f"  wrote {frame_count} frames")
+            else:
+                print("  empty frame (no valid depth)")
             time.sleep(0.005)  # small yield; camera FPS is the real limiter
     except KeyboardInterrupt:
         print("\nStopping.")

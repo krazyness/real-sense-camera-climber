@@ -19,73 +19,29 @@ import numpy as np
 import rs_python
 
 
-def write_pcd(path, points):
+def write_pcd(path, points, tmp_path):
     """
     Write an (N, 3) float32 array to a binary PCD file.
-    Uses atomic write (temp file + rename) so readers never see a partial file.
+    Uses atomic write (write to tmp then rename) so readers never see partial data.
     """
     n = len(points)
     header = (
-        "# .PCD v0.7 - Point Cloud Data file format\n"
-        "VERSION 0.7\n"
-        "FIELDS x y z\n"
-        "SIZE 4 4 4\n"
-        "TYPE F F F\n"
-        "COUNT 1 1 1\n"
+        f"# .PCD v0.7 - Point Cloud Data file format\n"
+        f"VERSION 0.7\n"
+        f"FIELDS x y z\n"
+        f"SIZE 4 4 4\n"
+        f"TYPE F F F\n"
+        f"COUNT 1 1 1\n"
         f"WIDTH {n}\n"
-        "HEIGHT 1\n"
-        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"HEIGHT 1\n"
+        f"VIEWPOINT 0 0 0 1 0 0 0\n"
         f"POINTS {n}\n"
-        "DATA binary\n"
+        f"DATA binary\n"
     )
-    dir_name = os.path.dirname(path) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".pcd")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(header.encode("ascii"))
-            f.write(points.astype(np.float32).tobytes())
-        os.replace(tmp_path, path)
-    except BaseException:
-        os.unlink(tmp_path)
-        raise
-
-
-def capture_frame(cam, K):
-    """
-    Grab one depth frame via RSCam, deproject to 3D, return (N, 3) float32 array.
-    Returns an empty array if no valid points.
-    """
-    depth_raw = cam.GetDepth()  # uint16 numpy array (h, w), values in mm
-
-    h, w = depth_raw.shape
-    depth_meters = depth_raw.astype(np.float32) / 1000.0  # mm → m
-
-    # Intrinsics from K matrix (3×3 list-of-lists)
-    fx = K[0][0]
-    fy = K[1][1]
-    ppx = K[0][2]
-    ppy = K[1][2]
-
-    # Build (u, v) grid
-    u = np.arange(w, dtype=np.float32)
-    v = np.arange(h, dtype=np.float32)
-    u, v = np.meshgrid(u, v)
-    u = u.flatten()
-    v = v.flatten()
-    z = depth_meters.flatten()
-
-    # Filter out zero-depth (invalid) pixels
-    valid = z > 0
-    u, v, z = u[valid], v[valid], z[valid]
-
-    if len(z) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-
-    # Deproject to 3D (camera coordinates)
-    x = (u - ppx) * z / fx
-    y = (v - ppy) * z / fy
-
-    return np.stack((x, y, z), axis=-1)
+    with open(tmp_path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(points.tobytes())      # already float32, no copy needed
+    os.replace(tmp_path, path)
 
 
 def main():
@@ -98,31 +54,67 @@ def main():
     )
     args = parser.parse_args()
 
-    # RSCam handles pipeline init + auto-exposure internally
+    # ── Camera init ──
     cam = rs_python.RSCam(enable_imu=False)
-    K = cam.GetK(depth=True)  # depth intrinsic matrix (3×3)
+    K = cam.GetK(depth=True)
 
-    print("RealSense camera initialised")
+    fx = np.float32(K[0][0])
+    fy = np.float32(K[1][1])
+    ppx = np.float32(K[0][2])
+    ppy = np.float32(K[1][2])
+
+    # Grab one frame to learn resolution, then pre-compute the pixel grid once
+    first = cam.GetDepth()
+    h, w = first.shape
+    u = np.arange(w, dtype=np.float32)
+    v = np.arange(h, dtype=np.float32)
+    u, v = np.meshgrid(u, v)
+    u_flat = (u.flatten() - ppx) / fx   # pre-baked (u-ppx)/fx
+    v_flat = (v.flatten() - ppy) / fy   # pre-baked (v-ppy)/fy
+
+    # Pre-allocate output buffer (worst case: every pixel valid)
+    buf = np.empty((w * h, 3), dtype=np.float32)
+
+    # Temp file path for atomic writes (reuse, don't mkstemp each frame)
+    dir_name = os.path.dirname(os.path.abspath(args.output))
+    tmp_path = os.path.join(dir_name, ".capture_tmp.pcd")
+
+    print(f"RealSense {w}×{h} ready")
     print(f"Writing point clouds to: {args.output}")
 
     frame_count = 0
+    t0 = time.monotonic()
     try:
         while True:
-            print(f"  grabbing frame {frame_count + 1}...", end="", flush=True)
-            points = capture_frame(cam, K)
-            print(f" got {len(points)} points", flush=True)
-            if len(points) > 0:
-                write_pcd(args.output, points)
-                frame_count += 1
-                if frame_count % 30 == 0:
-                    print(f"  wrote {frame_count} frames")
-            else:
-                print("  empty frame (no valid depth)")
-            time.sleep(0.005)  # small yield; camera FPS is the real limiter
+            # ── Grab depth ──
+            depth_raw = cam.GetDepth()
+            z = depth_raw.ravel().astype(np.float32)
+            z *= 0.001  # mm → m  (in-place)
+
+            # ── Filter invalid pixels & deproject ──
+            valid = z > 0
+            zv = z[valid]
+            n = len(zv)
+            if n > 0:
+                buf[:n, 0] = u_flat[valid] * zv   # x
+                buf[:n, 1] = v_flat[valid] * zv   # y
+                buf[:n, 2] = zv                    # z
+                write_pcd(args.output, buf[:n], tmp_path)
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                elapsed = time.monotonic() - t0
+                fps = frame_count / elapsed
+                print(f"  {frame_count} frames  |  {fps:.1f} fps  |  {n} pts")
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
         cam.Stop()
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

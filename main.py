@@ -12,8 +12,67 @@ import sys
 import time
 import numpy as np
 import pyransac3d as pyrsc
-import open3d as o3d
+from scipy import ndimage
 from networktables import NetworkTables
+
+
+# ── PCD I/O ──────────────────────────────────────────────────────────────────
+
+def read_pcd(path):
+    """
+    Read a binary PCD file with FIELDS x y z (float32).
+    Returns an (N, 3) float32 numpy array.
+    """
+    with open(path, "rb") as f:
+        num_points = 0
+        while True:
+            line = f.readline().decode("ascii", errors="replace").strip()
+            if line.startswith("POINTS"):
+                num_points = int(line.split()[1])
+            if line.startswith("DATA"):
+                break
+        if num_points == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        raw = f.read(num_points * 3 * 4)  # 3 floats × 4 bytes each
+    pts = np.frombuffer(raw, dtype=np.float32).reshape(-1, 3)
+    return pts
+
+
+# ── Clustering ───────────────────────────────────────────────────────────────
+
+def cluster_largest(points, voxel_size):
+    """
+    Voxel-grid connected-component clustering.
+    Discretises points into a 3D grid, runs scipy.ndimage.label for fast
+    connected components, then returns only the points in the largest cluster.
+    """
+    if len(points) == 0:
+        return points
+
+    mins = points.min(axis=0)
+    # Map each point to a voxel index
+    idx = ((points - mins) / voxel_size).astype(np.int32)
+    # Build a dense occupancy grid
+    grid_shape = idx.max(axis=0) + 1
+    # Safety: if grid would be absurdly large, fall back to returning all points
+    if np.prod(grid_shape) > 5_000_000:
+        return points
+    grid = np.zeros(grid_shape, dtype=np.int32)
+    grid[idx[:, 0], idx[:, 1], idx[:, 2]] = 1
+
+    # Connected components (26-connectivity)
+    struct = ndimage.generate_binary_structure(3, 3)
+    labelled, num_features = ndimage.label(grid, structure=struct)
+    if num_features == 0:
+        return points
+
+    # Find largest component
+    point_labels = labelled[idx[:, 0], idx[:, 1], idx[:, 2]]
+    unique, counts = np.unique(point_labels[point_labels > 0], return_counts=True)
+    if len(unique) == 0:
+        return points
+    best = unique[counts.argmax()]
+    return points[point_labels == best]
 
 
 def detect_climber(pcd_path, max_distance=1.25, plane_thresh=0.02,
@@ -25,8 +84,7 @@ def detect_climber(pcd_path, max_distance=1.25, plane_thresh=0.02,
     Returns (horizontal_offset, depth) or None if detection fails.
     """
     # ── Load ──
-    pcd = o3d.io.read_point_cloud(pcd_path)
-    pts = np.asarray(pcd.points)
+    pts = read_pcd(pcd_path)
     if len(pts) == 0:
         return None
 
@@ -56,15 +114,8 @@ def detect_climber(pcd_path, max_distance=1.25, plane_thresh=0.02,
 
     inlier_pts = pts[inliers]
 
-    # ── DBSCAN — keep only the largest cluster ──
-    pc = o3d.geometry.PointCloud()
-    pc.points = o3d.utility.Vector3dVector(inlier_pts)
-    labels = np.array(pc.cluster_dbscan(eps=plane_thresh * 3,
-                                        min_points=10,
-                                        print_progress=False))
-    if labels.max() >= 0:
-        unique, counts = np.unique(labels[labels >= 0], return_counts=True)
-        inlier_pts = inlier_pts[labels == unique[counts.argmax()]]
+    # ── Cluster — keep only the largest connected component ──
+    inlier_pts = cluster_largest(inlier_pts, voxel_size=plane_thresh * 3)
 
     # ── Results ──
     center = inlier_pts.mean(axis=0)

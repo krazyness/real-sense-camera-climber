@@ -12,16 +12,48 @@ Usage:
 """
 
 import argparse
+import os
+import tempfile
 import time
 import numpy as np
 import rs_python
-import open3d as o3d
+
+
+def write_pcd(path, points):
+    """
+    Write an (N, 3) float32 array to a binary PCD file.
+    Uses atomic write (temp file + rename) so readers never see a partial file.
+    """
+    n = len(points)
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {n}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {n}\n"
+        "DATA binary\n"
+    )
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".pcd")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(header.encode("ascii"))
+            f.write(points.astype(np.float32).tobytes())
+        os.replace(tmp_path, path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
 
 
 def capture_frame(cam, K):
     """
-    Grab one depth frame via RSCam, deproject to 3D, return PointCloud.
-    Returns an open3d.geometry.PointCloud (empty if no valid points).
+    Grab one depth frame via RSCam, deproject to 3D, return (N, 3) float32 array.
+    Returns an empty array if no valid points.
     """
     depth_raw = cam.GetDepth()  # uint16 numpy array (h, w), values in mm
 
@@ -47,17 +79,13 @@ def capture_frame(cam, K):
     u, v, z = u[valid], v[valid], z[valid]
 
     if len(z) == 0:
-        return o3d.geometry.PointCloud()
+        return np.empty((0, 3), dtype=np.float32)
 
     # Deproject to 3D (camera coordinates)
     x = (u - ppx) * z / fx
     y = (v - ppy) * z / fy
 
-    points = np.stack((x, y, z), axis=-1)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    return pcd
+    return np.stack((x, y, z), axis=-1)
 
 
 def main():
@@ -74,14 +102,14 @@ def main():
     cam = rs_python.RSCam(enable_imu=False)
     K = cam.GetK(depth=True)  # depth intrinsic matrix (3×3)
 
-    print(f"RealSense camera initialised")
+    print("RealSense camera initialised")
     print(f"Writing point clouds to: {args.output}")
 
     try:
         while True:
-            pcd = capture_frame(cam, K)
-            if len(pcd.points) > 0:
-                o3d.io.write_point_cloud(args.output, pcd, write_ascii=False)
+            points = capture_frame(cam, K)
+            if len(points) > 0:
+                write_pcd(args.output, points)
             time.sleep(0.005)  # small yield; camera FPS is the real limiter
     except KeyboardInterrupt:
         print("\nStopping.")

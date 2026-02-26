@@ -2,4 +2,3 @@ numpy
 open3d
 pyransac3d
 pynetworktables
-pyrealsense2

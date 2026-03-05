@@ -1,56 +1,50 @@
 """
-RealSense → PCD capture
+RealSense PCD snapshot tool  (Raspberry Pi)
 
-Continuously captures depth frames from an Intel RealSense camera and
-writes the point cloud to a .pcd file that main.py reads each loop.
-
-Uses the rs_python C++ pybind11 module (RSCam) instead of pyrealsense2.
+Press SPACEBAR to save a point cloud snapshot. Press q to quit.
+Camera streams continuously in the background to stay warm.
 
 Usage:
-    python capture.py                 # writes to frame.pcd (default)
-    python capture.py --output scan.pcd
+    python capture.py                        # saves snap_001.pcd, snap_002.pcd, ...
+    python capture.py --prefix myscan        # saves myscan_001.pcd, myscan_002.pcd, ...
 """
 
 import argparse
 import os
-import tempfile
-import time
+import select
+import sys
+import termios
+import tty
 import numpy as np
 import rs_python
 
 
-def write_pcd(path, points, tmp_path):
-    """
-    Write an (N, 3) float32 array to a binary PCD file.
-    Uses atomic write (write to tmp then rename) so readers never see partial data.
-    """
+def write_pcd(path, points):
+    """Write an (N, 3) float32 array to a binary PCD file."""
     n = len(points)
     header = (
-        f"# .PCD v0.7 - Point Cloud Data file format\n"
-        f"VERSION 0.7\n"
-        f"FIELDS x y z\n"
-        f"SIZE 4 4 4\n"
-        f"TYPE F F F\n"
-        f"COUNT 1 1 1\n"
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
         f"WIDTH {n}\n"
-        f"HEIGHT 1\n"
-        f"VIEWPOINT 0 0 0 1 0 0 0\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
         f"POINTS {n}\n"
-        f"DATA binary\n"
+        "DATA binary\n"
     )
-    with open(tmp_path, "wb") as f:
+    with open(path, "wb") as f:
         f.write(header.encode("ascii"))
-        f.write(points.tobytes())      # already float32, no copy needed
-    os.replace(tmp_path, path)
+        f.write(points.tobytes())
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Capture RealSense depth → PCD file (runs continuously)."
-    )
+    parser = argparse.ArgumentParser(description="RealSense PCD snapshots.")
     parser.add_argument(
-        "--output", "-o", default="frame.pcd",
-        help="Path for the output .pcd file (default: frame.pcd)"
+        "--prefix", "-p", default="snap",
+        help="Filename prefix (default: snap -> snap_001.pcd, snap_002.pcd, ...)"
     )
     args = parser.parse_args()
 
@@ -63,58 +57,60 @@ def main():
     ppx = np.float32(K[0][2])
     ppy = np.float32(K[1][2])
 
-    # Grab one frame to learn resolution, then pre-compute the pixel grid once
+    # First frame to learn resolution; pre-compute pixel grid once
     first = cam.GetDepth()
     h, w = first.shape
     u = np.arange(w, dtype=np.float32)
     v = np.arange(h, dtype=np.float32)
     u, v = np.meshgrid(u, v)
-    u_flat = (u.flatten() - ppx) / fx   # pre-baked (u-ppx)/fx
-    v_flat = (v.flatten() - ppy) / fy   # pre-baked (v-ppy)/fy
-
-    # Pre-allocate output buffer (worst case: every pixel valid)
+    u_flat = (u.flatten() - ppx) / fx
+    v_flat = (v.flatten() - ppy) / fy
     buf = np.empty((w * h, 3), dtype=np.float32)
 
-    # Temp file path for atomic writes (reuse, don't mkstemp each frame)
-    dir_name = os.path.dirname(os.path.abspath(args.output))
-    tmp_path = os.path.join(dir_name, ".capture_tmp.pcd")
+    def grab():
+        """Grab one depth frame, deproject, return buf[:n] view."""
+        depth_raw = cam.GetDepth()
+        z = depth_raw.ravel().astype(np.float32)
+        z *= 0.001
+        valid = z > 0
+        zv = z[valid]
+        n = len(zv)
+        if n == 0:
+            return buf[:0]
+        buf[:n, 0] = u_flat[valid] * zv
+        buf[:n, 1] = v_flat[valid] * zv
+        buf[:n, 2] = zv
+        return buf[:n]
 
-    print(f"RealSense {w}×{h} ready")
-    print(f"Writing point clouds to: {args.output}")
+    print(f"RealSense {w}x{h} ready")
+    print("Press SPACEBAR to save a snapshot, q to quit.")
 
-    frame_count = 0
-    t0 = time.monotonic()
+    # Put terminal in cbreak mode for single-keypress detection
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+
+    snap_num = 0
     try:
         while True:
-            # ── Grab depth ──
-            depth_raw = cam.GetDepth()
-            z = depth_raw.ravel().astype(np.float32)
-            z *= 0.001  # mm → m  (in-place)
-
-            # ── Filter invalid pixels & deproject ──
-            valid = z > 0
-            zv = z[valid]
-            n = len(zv)
-            if n > 0:
-                buf[:n, 0] = u_flat[valid] * zv   # x
-                buf[:n, 1] = v_flat[valid] * zv   # y
-                buf[:n, 2] = zv                    # z
-                write_pcd(args.output, buf[:n], tmp_path)
-
-            frame_count += 1
-            if frame_count % 100 == 0:
-                elapsed = time.monotonic() - t0
-                fps = frame_count / elapsed
-                print(f"  {frame_count} frames  |  {fps:.1f} fps  |  {n} pts")
+            grab()  # keep camera streaming (discards frame)
+            if select.select([sys.stdin], [], [], 0)[0]:
+                key = sys.stdin.read(1)
+                if key == " ":
+                    points = grab().copy()  # copy since buf is reused
+                    if len(points) > 0:
+                        snap_num += 1
+                        path = f"{args.prefix}_{snap_num:03d}.pcd"
+                        write_pcd(path, points)
+                        print(f"  [{snap_num}] saved {path}  ({len(points)} pts)")
+                    else:
+                        print("  empty frame, try again")
+                elif key == "q":
+                    break
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         cam.Stop()
-        if os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 if __name__ == "__main__":
